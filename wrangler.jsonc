@@ -1,0 +1,92 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "hermes-sandbox",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-05-06",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true,
+  },
+  // Admin UI static assets (React SPA built to dist/client)
+  "assets": {
+    "directory": "./dist/client",
+    "not_found_handling": "single-page-application",
+    "html_handling": "auto-trailing-slash",
+    "binding": "ASSETS",
+    "run_worker_first": true,
+  },
+  "rules": [
+    { "type": "Text", "globs": ["**/*.html"], "fallthrough": false },
+    { "type": "Data", "globs": ["**/*.png"], "fallthrough": false },
+  ],
+  "build": {
+    "command": "npm run build",
+  },
+  // Hermes container — one instance, standard compute
+  "containers": [
+    {
+      "class_name": "Sandbox",
+      "image": "./Dockerfile",
+      "instance_type": "standard-1",
+      "max_instances": 1,
+    },
+  ],
+  // Durable Object that owns the container lifecycle
+  "durable_objects": {
+    "bindings": [
+      {
+        "class_name": "Sandbox",
+        "name": "Sandbox",
+      },
+    ],
+  },
+  "migrations": [
+    {
+      "new_sqlite_classes": ["Sandbox"],
+      "tag": "v1",
+    },
+  ],
+  // R2 bucket for Sandbox SDK backup/restore — persists /home/hermes across restarts
+  "r2_buckets": [
+    {
+      "binding": "BACKUP_BUCKET",
+      "bucket_name": "hermes-data",
+    },
+  ],
+  // Browser Rendering binding — proxied into the container for Hermes browser automation
+  "browser": {
+    "binding": "BROWSER",
+  },
+  // Wake container 1 min before each hour so Hermes cron jobs don't cold-start
+  "triggers": {
+    "crons": ["* * * * *"],
+  },
+  // ── Required secrets (set via `wrangler secret put`) ─────────────────────────
+  //
+  // AI provider — choose ONE:
+  //   Option A: Cloudflare AI Gateway (recommended)
+  //     CF_AI_GATEWAY_ACCOUNT_ID  — your Cloudflare account ID
+  //     CF_AI_GATEWAY_GATEWAY_ID  — AI Gateway ID (create at dash.cloudflare.com)
+  //     CF_AI_GATEWAY_API_KEY     — API key for your upstream provider
+  //     CF_AI_GATEWAY_MODEL       — e.g. "openrouter/openai/gpt-4o"
+  //
+  //   Option B: Direct OpenRouter
+  //     OPENROUTER_API_KEY        — your OpenRouter key
+  //     OPENROUTER_MODEL          — e.g. "openai/gpt-4o" (default)
+  //
+  // Security:
+  //   HERMES_GATEWAY_TOKEN        — random hex32; protects dashboard access
+  //                                 generate: openssl rand -hex 32
+  //   CF_ACCESS_TEAM_DOMAIN       — e.g. "myteam.cloudflareaccess.com"
+  //   CF_ACCESS_AUD               — Cloudflare Access Application Audience tag
+  //
+  // Optional messaging platforms:
+  //   TELEGRAM_BOT_TOKEN
+  //   TELEGRAM_ALLOWED_CHATS      — comma-separated chat IDs (leave blank = all)
+  //   DISCORD_BOT_TOKEN
+  //   SLACK_BOT_TOKEN
+  //   SLACK_APP_TOKEN
+  //
+  // Optional:
+  //   SANDBOX_SLEEP_AFTER         — e.g. "10m" to reduce cost; default keeps container alive
+}
