@@ -42,7 +42,7 @@ WORKDIR /opt/hermes
 # npm build step is needed here.
 RUN uv venv .venv --python python3.13 && \
     uv pip install --python .venv/bin/python --no-cache \
-      'hermes-agent[all,messaging]'
+      'hermes-agent[all,messaging]' playwright
 
 # ── Playwright browsers ───────────────────────────────────────────────────────
 RUN .venv/bin/playwright install --with-deps chromium
