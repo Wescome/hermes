@@ -385,7 +385,9 @@ app.use('*', async (c, next) => {
   await next();
 });
 
-// ── Public routes (no auth) ───────────────────────────────────────────────────
+// ── Public routes ─────────────────────────────────────────────────────────────
+// Only /health and /auth/* are public. Everything under /api/* and /_admin/*
+// requires the hermes_auth cookie set at login.
 
 app.get('/health', (c) => c.json({ ok: true }));
 
@@ -415,6 +417,11 @@ app.get('/auth/logout', (c) => new Response(null, {
   },
 }));
 
+app.use('/api/*', async (c, next) => {
+  if (!isAuthed(c.req.raw, c.env)) return c.json({ error: 'Unauthorized' }, 401);
+  await next();
+});
+
 app.get('/api/status', async (c) => {
   const sandbox = c.get('sandbox');
   // Restore-if-needed still runs in the Worker (it depends on the R2 binding,
@@ -428,9 +435,6 @@ app.get('/api/status', async (c) => {
   return c.json({ running: portOpen, status: portOpen ? 'running' : 'starting' });
 });
 
-// Public debug route — no auth, used to diagnose container startup without
-// needing Cloudflare Access. Returns `ps`, the start-hermes.sh log, and the
-// list of tracked processes inside the sandbox.
 app.get('/api/debug', async (c) => {
   const sandbox = c.get('sandbox');
   const [log, procs, pyInfo, hermesInfo, asHermes] = await Promise.allSettled([
@@ -462,14 +466,8 @@ app.get('/api/debug', async (c) => {
 });
 
 // ── Admin API ─────────────────────────────────────────────────────────────────
-// All /api/admin/* and /_admin/* routes require the hermes_auth cookie.
-// The CF_ACCESS_* secrets are set for network-level protection, but the Worker
-// enforces cookie auth itself so there is no unauthenticated path to these routes.
-
-app.use('/api/admin/*', async (c, next) => {
-  if (!isAuthed(c.req.raw, c.env)) return c.json({ error: 'Unauthorized' }, 401);
-  await next();
-});
+// /api/admin/* is already covered by the /api/* guard above.
+// /_admin/* (the React SPA) needs its own guard since it's outside /api/.
 
 app.use('/_admin/*', async (c, next) => {
   if (!isAuthed(c.req.raw, c.env)) return c.redirect('/auth/login');
