@@ -14,14 +14,71 @@ import { getSandbox, Sandbox, type SandboxOptions, type Process } from '@cloudfl
 import type { AppEnv, HermesEnv } from './types';
 import { GATEWAY_PORT, STARTUP_TIMEOUT_MS, BACKUP_DIR } from './config';
 
-export { Sandbox };
+// ── DO subclass: launches Hermes from the container lifecycle ─────────────────
+//
+// We override onStart() so Hermes is started by the Durable Object the moment
+// the container is healthy. This is critical because:
+//
+//   - Previously we called `startProcess` from a Worker via `ctx.waitUntil()`.
+//   - The Worker's RPC connection to the DO can be canceled when the HTTP
+//     response is sent (DO logs showed `outcome: "canceled"`), so the process
+//     never reliably started.
+//   - `onStart` runs *inside* the DO's lifecycle, after the container is up.
+//     No Worker timeout can cancel it.
+//
+// The Container base type declares `onStart(): void | Promise<void>` and the
+// platform awaits it inside `blockConcurrencyWhile`, so an async override is
+// safe — `startProcess` resolves as soon as the process is spawned, not when
+// Hermes finishes booting (the port-check polling in /api/status handles that).
+class HermesSandbox extends Sandbox<HermesEnv> {
+  override onStart(): void {
+    // Run the parent's sync side-effects (logger + version check) first.
+    super.onStart();
+
+    // Fire the actual Hermes launch async. We don't await here because the
+    // platform awaits onStart() inside blockConcurrencyWhile, and we don't
+    // want to hold the DO any longer than the spawn itself.
+    void this.launchHermes();
+  }
+
+  private async launchHermes(): Promise<void> {
+    // Guard: bail if a hermes process is already running (handles onStart racing on DO reset)
+    try {
+      const procs = await this.listProcesses();
+      const already = procs.some(
+        (p) =>
+          (p.command.includes('start-hermes.sh') || p.command.includes('hermes dashboard')) &&
+          (p.status === 'running' || p.status === 'starting'),
+      );
+      if (already) {
+        console.log('[HermesSandbox] launchHermes: already running, skipping');
+        return;
+      }
+    } catch { /* listProcesses failure is non-fatal — proceed with start attempt */ }
+
+    const envVars = buildContainerEnv(this.env);
+    try {
+      await this.startProcess('/usr/local/bin/start-hermes.sh', {
+        processId: 'hermes-dashboard',
+        env: Object.keys(envVars).length > 0 ? envVars : undefined,
+        onOutput: (stream, data) => console.log(`[hermes/${stream}]`, data.trim()),
+        onExit: (code) => console.log('[hermes/exit] code:', code),
+      });
+      console.log('[HermesSandbox] onStart: Hermes launched');
+    } catch (err) {
+      console.error('[HermesSandbox] onStart: startProcess failed:', err);
+    }
+  }
+}
+
+// wrangler.jsonc binds `class_name: "Sandbox"`, so we must export under that name.
+export { HermesSandbox as Sandbox };
 
 // ── Loading / error pages ─────────────────────────────────────────────────────
 
 const LOADING_HTML = `<!DOCTYPE html>
 <html lang="en">
 <head><meta charset="utf-8"><title>Hermes — Starting…</title>
-<meta http-equiv="refresh" content="5">
 <style>
   body { font-family: system-ui, sans-serif; display: flex; align-items: center;
          justify-content: center; height: 100vh; margin: 0; background: #0f0f0f; color: #eee; }
@@ -36,8 +93,23 @@ const LOADING_HTML = `<!DOCTYPE html>
   <div class="card">
     <div class="spinner"></div>
     <h2>Hermes is starting…</h2>
-    <p>This page will refresh automatically.</p>
+    <p id="msg">Waiting for container to boot (60–90 seconds)…</p>
   </div>
+  <script>
+    let attempts = 0;
+    async function poll() {
+      attempts++;
+      try {
+        const r = await fetch('/api/status');
+        const d = await r.json();
+        if (d.running) { location.reload(); return; }
+      } catch {}
+      document.getElementById('msg').textContent =
+        'Still starting… (' + attempts * 5 + 's elapsed)';
+      setTimeout(poll, 5000);
+    }
+    setTimeout(poll, 5000);
+  </script>
 </body></html>`;
 
 // ── Persistence (R2 backup/restore) ───────────────────────────────────────────
@@ -116,6 +188,10 @@ function buildContainerEnv(env: HermesEnv): Record<string, string> {
 
   const set = (k: string, v: string | undefined) => { if (v) vars[k] = v; };
 
+  // Hermes auth — used to pin the ephemeral session token so the Worker can
+  // inject it into proxied API/WebSocket requests (X-Hermes-Session-Token).
+  set('HERMES_GATEWAY_TOKEN', env.HERMES_GATEWAY_TOKEN);
+
   // AI provider
   set('CF_AI_GATEWAY_ACCOUNT_ID', env.CF_AI_GATEWAY_ACCOUNT_ID);
   set('CF_AI_GATEWAY_GATEWAY_ID', env.CF_AI_GATEWAY_GATEWAY_ID);
@@ -123,6 +199,8 @@ function buildContainerEnv(env: HermesEnv): Record<string, string> {
   set('CF_AI_GATEWAY_MODEL', env.CF_AI_GATEWAY_MODEL);
   set('OPENROUTER_API_KEY', env.OPENROUTER_API_KEY);
   set('OPENROUTER_MODEL', env.OPENROUTER_MODEL);
+  set('OFOX_API_KEY', env.OFOX_API_KEY);
+  set('OFOX_MODEL', env.OFOX_MODEL);
 
   // Messaging
   set('TELEGRAM_BOT_TOKEN', env.TELEGRAM_BOT_TOKEN);
@@ -154,7 +232,9 @@ export async function findHermesProcess(sandbox: Sandbox): Promise<Process | nul
 
 async function isPortOpen(sandbox: Sandbox): Promise<boolean> {
   try {
-    const r = await sandbox.exec(`nc -z localhost ${GATEWAY_PORT}`);
+    const r = await sandbox.exec(
+      `bash -c 'echo >/dev/tcp/localhost/${GATEWAY_PORT}' 2>/dev/null`,
+    );
     return r.exitCode === 0;
   } catch {
     return false;
@@ -181,51 +261,38 @@ export async function killHermes(sandbox: Sandbox): Promise<void> {
   await new Promise((r) => setTimeout(r, 2000));
 }
 
-export async function ensureHermes(sandbox: Sandbox, env: HermesEnv): Promise<Process | null> {
-  const existing = await findHermesProcess(sandbox);
+// ensureHermes kicks off Hermes if it's not running, then returns immediately.
+// It does NOT wait for port 9119 to open — the loading page polls /api/status for that.
+// Use ctx.waitUntil(ensureHermes(...)) so it survives after the response is sent.
+export async function ensureHermes(sandbox: Sandbox, env: HermesEnv): Promise<void> {
+  const existing = await findHermesProcess(sandbox).catch(() => null);
   if (existing) {
-    console.log('[gateway] Found existing Hermes process:', existing.id);
-    try {
-      await existing.waitForPort(GATEWAY_PORT, { mode: 'tcp', timeout: STARTUP_TIMEOUT_MS });
-      return existing;
-    } catch {
-      console.log('[gateway] Existing process not reachable, restarting');
-      try { await existing.kill(); } catch { /* ignore */ }
-    }
+    console.log('[gateway] Hermes already running:', existing.id);
+    return;
   }
 
-  if (await isPortOpen(sandbox)) {
-    console.log('[gateway] Port already open — Hermes running (undetected by listProcesses)');
-    return null;
+  if (await isPortOpen(sandbox).catch(() => false)) {
+    console.log('[gateway] Port already open — Hermes running');
+    return;
   }
 
   console.log('[gateway] Starting Hermes');
   const envVars = buildContainerEnv(env);
-  let proc: Process;
   try {
-    proc = await sandbox.startProcess('/usr/local/bin/start-hermes.sh', {
+    await sandbox.startProcess('/usr/local/bin/start-hermes.sh', {
       env: Object.keys(envVars).length > 0 ? envVars : undefined,
     });
+    console.log('[gateway] Hermes process launched');
   } catch (err) {
     console.error('[gateway] Failed to start process:', err);
-    throw err;
   }
-
-  try {
-    await proc.waitForPort(GATEWAY_PORT, { mode: 'tcp', timeout: STARTUP_TIMEOUT_MS });
-    console.log('[gateway] Hermes dashboard is ready');
-  } catch (e) {
-    const logs = await proc.getLogs().catch(() => ({ stdout: '', stderr: '' }));
-    throw new Error(
-      `Hermes failed to start. stderr: ${logs.stderr || '(empty)'}`,
-      { cause: e },
-    );
-  }
-
-  return proc;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+function withTimeout<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
+  return Promise.race([p, new Promise<T>((r) => setTimeout(() => r(fallback), ms))]);
+}
 
 function isCrashedError(err: unknown): boolean {
   return err instanceof Error && err.message.includes('is not listening');
@@ -238,42 +305,56 @@ function buildSandboxOptions(env: HermesEnv): SandboxOptions {
 
 function validateEnv(env: HermesEnv): string[] {
   const missing: string[] = [];
-  const dev = env.DEV_MODE === 'true';
-
   if (!env.HERMES_GATEWAY_TOKEN) missing.push('HERMES_GATEWAY_TOKEN');
-  if (!dev && !env.CF_ACCESS_TEAM_DOMAIN) missing.push('CF_ACCESS_TEAM_DOMAIN');
-  if (!dev && !env.CF_ACCESS_AUD) missing.push('CF_ACCESS_AUD');
-
-  const hasGateway = !!(
-    env.CF_AI_GATEWAY_API_KEY &&
-    env.CF_AI_GATEWAY_ACCOUNT_ID &&
-    env.CF_AI_GATEWAY_GATEWAY_ID
-  );
+  const hasGateway = !!(env.CF_AI_GATEWAY_API_KEY && env.CF_AI_GATEWAY_ACCOUNT_ID && env.CF_AI_GATEWAY_GATEWAY_ID);
   const hasOpenRouter = !!env.OPENROUTER_API_KEY;
-  if (!hasGateway && !hasOpenRouter) {
-    missing.push('OPENROUTER_API_KEY or CF_AI_GATEWAY_* triple');
+  const hasOFOx = !!env.OFOX_API_KEY;
+  if (!hasGateway && !hasOpenRouter && !hasOFOx) {
+    missing.push('OFOX_API_KEY, OPENROUTER_API_KEY, or CF_AI_GATEWAY_* triple');
   }
-
   return missing;
 }
 
-// ── Cloudflare Access auth ─────────────────────────────────────────────────────
+// ── Cookie auth ───────────────────────────────────────────────────────────────
+// Simple single-user auth: enter HERMES_GATEWAY_TOKEN once, get an HttpOnly
+// cookie. No CF Access, no OAuth apps, no email OTPs.
 
-async function verifyAccess(req: Request, env: HermesEnv): Promise<boolean> {
+const AUTH_COOKIE = 'hermes_auth';
+const LOGIN_MAX_AGE = 60 * 60 * 24 * 30; // 30 days
+
+const LOGIN_HTML = (error = '') => `<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Hermes — Login</title>
+<style>
+  body { font-family: system-ui, sans-serif; display:flex; align-items:center;
+         justify-content:center; height:100vh; margin:0; background:#0f0f0f; color:#eee; }
+  .card { width:340px; }
+  h2 { margin:0 0 24px; font-size:1.25rem; }
+  input { width:100%; box-sizing:border-box; padding:10px 12px; background:#1a1a1a;
+          border:1px solid #333; border-radius:6px; color:#eee; font-size:1rem; margin-bottom:12px; }
+  button { width:100%; padding:10px; background:#7c3aed; border:none; border-radius:6px;
+           color:#fff; font-size:1rem; cursor:pointer; }
+  button:hover { background:#6d28d9; }
+  .err { color:#f87171; font-size:0.85rem; margin-bottom:10px; }
+</style></head>
+<body><div class="card">
+  <h2>Hermes</h2>
+  ${error ? `<p class="err">${error}</p>` : ''}
+  <form method="POST" action="/auth/login">
+    <input type="password" name="token" placeholder="Access token" autofocus autocomplete="current-password" />
+    <button type="submit">Sign in</button>
+  </form>
+</div></body></html>`;
+
+function isAuthed(req: Request, env: HermesEnv): boolean {
   if (env.DEV_MODE === 'true') return true;
+  const cookies = req.headers.get('cookie') ?? '';
+  const match = cookies.match(new RegExp(`(?:^|;\\s*)${AUTH_COOKIE}=([^;]+)`));
+  return !!match && match[1] === env.HERMES_GATEWAY_TOKEN;
+}
 
-  const jwt = req.headers.get('Cf-Access-Jwt-Assertion');
-  if (!jwt || !env.CF_ACCESS_TEAM_DOMAIN || !env.CF_ACCESS_AUD) return false;
-
-  try {
-    const { createRemoteJWKSet, jwtVerify } = await import('jose');
-    const certsUrl = `https://${env.CF_ACCESS_TEAM_DOMAIN}/cdn-cgi/access/certs`;
-    const JWKS = createRemoteJWKSet(new URL(certsUrl));
-    const { payload } = await jwtVerify(jwt, JWKS, { audience: env.CF_ACCESS_AUD });
-    return !!(payload as { email?: string }).email;
-  } catch {
-    return false;
-  }
+function authCookieHeader(token: string): string {
+  return `${AUTH_COOKIE}=${token}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${LOGIN_MAX_AGE}`;
 }
 
 // ── Cron (backup on schedule) ──────────────────────────────────────────────────
@@ -308,16 +389,76 @@ app.use('*', async (c, next) => {
 
 app.get('/health', (c) => c.json({ ok: true }));
 
+// ── Login routes (no auth required) ──────────────────────────────────────────
+app.get('/auth/login', (c) => c.html(LOGIN_HTML()));
+
+app.post('/auth/login', async (c) => {
+  const body = await c.req.parseBody();
+  const token = String(body['token'] ?? '').trim();
+  if (!token || token !== c.env.HERMES_GATEWAY_TOKEN) {
+    return c.html(LOGIN_HTML('Invalid token — try again.'), 401);
+  }
+  return new Response(null, {
+    status: 302,
+    headers: {
+      'Location': '/',
+      'Set-Cookie': authCookieHeader(token),
+    },
+  });
+});
+
+app.get('/auth/logout', (c) => new Response(null, {
+  status: 302,
+  headers: {
+    'Location': '/auth/login',
+    'Set-Cookie': `${AUTH_COOKIE}=; Path=/; HttpOnly; Secure; Max-Age=0`,
+  },
+}));
+
 app.get('/api/status', async (c) => {
   const sandbox = c.get('sandbox');
-  try {
-    await restoreIfNeeded(sandbox, c.env.BACKUP_BUCKET);
-  } catch { /* non-fatal */ }
-  try {
-    await ensureHermes(sandbox, c.env);
-  } catch { /* non-fatal */ }
-  const proc = await findHermesProcess(sandbox);
-  return c.json({ running: !!proc, status: proc?.status ?? 'stopped' });
+  // Restore-if-needed still runs in the Worker (it depends on the R2 binding,
+  // which the DO doesn't touch). Hermes startup itself is now handled by
+  // HermesSandbox.onStart() — no need to call ensureHermes from the Worker.
+  c.executionCtx.waitUntil(
+    restoreIfNeeded(sandbox, c.env.BACKUP_BUCKET).catch(() => {}),
+  );
+  // Port open = Hermes is actually serving requests.
+  const portOpen = await withTimeout(isPortOpen(sandbox).catch(() => false), 4_000, false);
+  return c.json({ running: portOpen, status: portOpen ? 'running' : 'starting' });
+});
+
+// Public debug route — no auth, used to diagnose container startup without
+// needing Cloudflare Access. Returns `ps`, the start-hermes.sh log, and the
+// list of tracked processes inside the sandbox.
+app.get('/api/debug', async (c) => {
+  const sandbox = c.get('sandbox');
+  const [log, procs, pyInfo, hermesInfo, asHermes] = await Promise.allSettled([
+    sandbox.exec('cat /tmp/hermes-start.log 2>/dev/null || echo NO_LOG'),
+    sandbox.listProcesses(),
+    sandbox.exec(
+      'ls -la /opt/hermes/.venv/bin/python /opt/hermes/.venv/bin/python3 /opt/hermes/.venv/bin/python3.13 2>&1; ' +
+      'readlink -f /opt/hermes/.venv/bin/python 2>&1; ' +
+      'ls -la $(readlink -f /opt/hermes/.venv/bin/python) 2>&1'
+    ),
+    sandbox.exec(
+      'ls -la /opt/hermes/.venv/bin/hermes 2>&1; ' +
+      'head -1 /opt/hermes/.venv/bin/hermes 2>&1; ' +
+      'id hermes 2>&1'
+    ),
+    sandbox.exec(
+      'gosu hermes /opt/hermes/.venv/bin/python --version 2>&1; ' +
+      'gosu hermes /opt/hermes/.venv/bin/hermes --version 2>&1; ' +
+      'gosu hermes /opt/hermes/.venv/bin/python -c "import yaml; print(yaml.__version__)" 2>&1'
+    ),
+  ]);
+  return c.json({
+    log: log.status === 'fulfilled' ? log.value.stdout : String(log.reason),
+    procs: procs.status === 'fulfilled' ? procs.value : String(procs.reason),
+    pyInfo: pyInfo.status === 'fulfilled' ? pyInfo.value.stdout : String(pyInfo.reason),
+    hermesInfo: hermesInfo.status === 'fulfilled' ? hermesInfo.value.stdout : String(hermesInfo.reason),
+    asHermes: asHermes.status === 'fulfilled' ? asHermes.value.stdout : String(asHermes.reason),
+  });
 });
 
 // ── Admin API (protected — CF Access required) ────────────────────────────────
@@ -343,7 +484,7 @@ app.get('/api/admin/status', async (c) => {
     } catch { /* non-fatal */ }
   }
 
-  const uptimeMs = proc?.startedAt ? Date.now() - new Date(proc.startedAt).getTime() : null;
+  const uptimeMs = proc?.startTime ? Date.now() - proc.startTime.getTime() : null;
 
   return c.json({
     running: !!proc,
@@ -378,6 +519,30 @@ app.post('/api/admin/backup', async (c) => {
   }
 });
 
+app.post('/api/admin/start-gateway', async (c) => {
+  const sandbox = c.get('sandbox');
+  try {
+    const r = await sandbox.exec(
+      `gosu hermes bash -c 'source /opt/hermes/.venv/bin/activate && nohup hermes gateway >/tmp/hermes-gateway.log 2>&1 &'`,
+    );
+    return c.json({ ok: true, exitCode: r.exitCode, stdout: r.stdout, stderr: r.stderr });
+  } catch (err) {
+    return c.json({ ok: false, message: String(err) }, 500);
+  }
+});
+
+app.post('/api/admin/exec', async (c) => {
+  const sandbox = c.get('sandbox');
+  const body = await c.req.json().catch(() => ({})) as { cmd?: string };
+  if (!body.cmd) return c.json({ error: 'missing cmd' }, 400);
+  try {
+    const r = await sandbox.exec(body.cmd);
+    return c.json({ exitCode: r.exitCode, stdout: r.stdout, stderr: r.stderr });
+  } catch (err) {
+    return c.json({ error: String(err) }, 500);
+  }
+});
+
 app.post('/api/admin/restart', async (c) => {
   const sandbox = c.get('sandbox');
   try {
@@ -387,8 +552,7 @@ app.post('/api/admin/restart', async (c) => {
       try { await createSnapshot(sandbox, c.env.BACKUP_BUCKET); } catch { /* non-fatal */ }
       await killHermes(sandbox);
     }
-    // Fire-and-forget — next incoming request will waitForPort
-    void ensureHermes(sandbox, c.env).catch(() => {});
+    c.executionCtx.waitUntil(ensureHermes(sandbox, c.env).catch(() => {}));
     return c.json({ ok: true, message: 'Hermes is restarting' });
   } catch (err) {
     return c.json({ ok: false, message: String(err) }, 500);
@@ -413,15 +577,12 @@ app.use('*', async (c, next) => {
   await next();
 });
 
-// CF Access auth on all routes except public ones above
+// Cookie auth — redirect to login page if not authenticated
 app.use('*', async (c, next) => {
-  const ok = await verifyAccess(c.req.raw, c.env);
-  if (!ok) {
+  if (!isAuthed(c.req.raw, c.env)) {
     const acceptsHtml = c.req.header('Accept')?.includes('text/html');
-    if (acceptsHtml) {
-      return c.html('<h1>Access denied</h1><p>Cloudflare Access required.</p>', 403);
-    }
-    return c.json({ error: 'Access denied' }, 403);
+    if (acceptsHtml) return c.redirect('/auth/login');
+    return c.json({ error: 'Unauthorized' }, 401);
   }
   await next();
 });
@@ -434,29 +595,39 @@ app.all('*', async (c) => {
   const isWS = req.headers.get('Upgrade')?.toLowerCase() === 'websocket';
   const wantsHtml = req.headers.get('Accept')?.includes('text/html');
 
-  // For browser navigations: serve loading page if Hermes not yet ready
+  // For browser navigations: show loading page if port 9119 isn't open yet.
   if (!isWS && wantsHtml) {
-    const proc = await findHermesProcess(sandbox).catch(() => null);
-    if (!proc) {
+    const portOpen = await withTimeout(isPortOpen(sandbox).catch(() => false), 4_000, false);
+    if (!portOpen) {
+      // The DO's onStart() is responsible for launching Hermes — the Worker
+      // only kicks off restore-if-needed here (which uses R2). The browser will
+      // keep polling /api/status until the port opens.
+      c.executionCtx.waitUntil(
+        restoreIfNeeded(sandbox, c.env.BACKUP_BUCKET).catch(() => {}),
+      );
       return c.html(LOADING_HTML);
     }
   }
 
-  // For API/asset requests: ensure Hermes is up before proxying
+  // For API/asset requests: ensure port is open before proxying.
   if (!isWS && !wantsHtml) {
-    try { await restoreIfNeeded(sandbox, c.env.BACKUP_BUCKET); } catch { /* non-fatal */ }
-    try {
-      await ensureHermes(sandbox, c.env);
-    } catch (err) {
-      return c.json({ error: 'Hermes not ready', details: String(err) }, 503);
+    const portOpen = await withTimeout(isPortOpen(sandbox).catch(() => false), 4_000, false);
+    if (!portOpen) {
+      c.executionCtx.waitUntil(
+        restoreIfNeeded(sandbox, c.env.BACKUP_BUCKET).catch(() => {}),
+      );
+      return c.json({ error: 'Hermes not ready' }, 503);
     }
   }
 
   // ── WebSocket ──────────────────────────────────────────────────────────────
   if (isWS) {
-    // Inject gateway token if the user lost it through a CF Access redirect
+    // The Hermes session token (now fixed = HERMES_GATEWAY_TOKEN) is required as
+    // ?token= in the WebSocket URL. Always inject it so both browser-supplied and
+    // direct connections work — the browser's JS reads window.__HERMES_SESSION_TOKEN__
+    // (set to HERMES_GATEWAY_TOKEN after our patch) and adds it, so this is idempotent.
     let wsReq = req;
-    if (c.env.HERMES_GATEWAY_TOKEN && !url.searchParams.has('token')) {
+    if (c.env.HERMES_GATEWAY_TOKEN) {
       const u = new URL(url.toString());
       u.searchParams.set('token', c.env.HERMES_GATEWAY_TOKEN);
       wsReq = new Request(u.toString(), req);
@@ -470,7 +641,7 @@ app.all('*', async (c) => {
         console.log('[ws] Hermes crashed — restoring and restarting');
         await killHermes(sandbox);
         try { await restoreIfNeeded(sandbox, c.env.BACKUP_BUCKET); } catch { /* non-fatal */ }
-        await ensureHermes(sandbox, c.env);
+        await ensureHermes(sandbox, c.env).catch(() => {});
         try {
           containerResp = await sandbox.wsConnect(wsReq, GATEWAY_PORT);
         } catch (retryErr) {
@@ -506,15 +677,27 @@ app.all('*', async (c) => {
   }
 
   // ── HTTP proxy ─────────────────────────────────────────────────────────────
+  // Inject the Hermes session token so the Worker can reach Hermes API endpoints
+  // on behalf of the browser. Hermes is patched at startup to use HERMES_GATEWAY_TOKEN
+  // as its _SESSION_TOKEN, so this header satisfies Hermes's auth middleware.
   let resp: Response;
   try {
-    resp = await sandbox.containerFetch(req, GATEWAY_PORT);
+    const hermesReq = c.env.HERMES_GATEWAY_TOKEN
+      ? new Request(req, {
+          headers: (() => {
+            const h = new Headers(req.headers);
+            h.set('X-Hermes-Session-Token', c.env.HERMES_GATEWAY_TOKEN);
+            return h;
+          })(),
+        })
+      : req;
+    resp = await sandbox.containerFetch(hermesReq, GATEWAY_PORT);
   } catch (err) {
     if (isCrashedError(err)) {
       console.log('[http] Hermes crashed — restoring and restarting');
       await killHermes(sandbox);
       try { await restoreIfNeeded(sandbox, c.env.BACKUP_BUCKET); } catch { /* non-fatal */ }
-      await ensureHermes(sandbox, c.env);
+      await ensureHermes(sandbox, c.env).catch(() => {});
       try {
         resp = await sandbox.containerFetch(req, GATEWAY_PORT);
       } catch {

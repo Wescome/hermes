@@ -17,6 +17,11 @@ export interface HermesEnv {
   /** Default: "openai/gpt-4o" */
   OPENROUTER_MODEL?: string;
 
+  // ── AI provider: OFOx.ai (ofox.ai) ───────────────────────────────────────
+  OFOX_API_KEY?: string;
+  /** Default: "openai/gpt-4o" */
+  OFOX_MODEL?: string;
+
   // ── Security ───────────────────────────────────────────────────────────────
   /** Random hex32 — protects Hermes dashboard; generate: openssl rand -hex 32 */
   HERMES_GATEWAY_TOKEN?: string;

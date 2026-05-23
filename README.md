@@ -87,12 +87,16 @@ echo "$HERMES_GATEWAY_TOKEN" | npx wrangler secret put HERMES_GATEWAY_TOKEN
 **AI provider — choose one:**
 
 ```bash
-# Option A: OpenRouter (simplest)
+# Option A: OFOx.ai — unified gateway for 100+ models (ofox.ai)
+npx wrangler secret put OFOX_API_KEY
+# Optionally pin a model (default: openai/gpt-4o)
+npx wrangler secret put OFOX_MODEL   # e.g. anthropic/claude-sonnet-4-5, openai/gpt-4o
+
+# Option B: OpenRouter
 npx wrangler secret put OPENROUTER_API_KEY
-# Then optionally pin a model (default: openai/gpt-4o)
 npx wrangler secret put OPENROUTER_MODEL   # e.g. openai/gpt-4o, anthropic/claude-sonnet-4-5
 
-# Option B: Cloudflare AI Gateway (analytics + caching)
+# Option C: Cloudflare AI Gateway (analytics + caching)
 npx wrangler secret put CF_AI_GATEWAY_ACCOUNT_ID   # your Cloudflare account ID
 npx wrangler secret put CF_AI_GATEWAY_GATEWAY_ID   # create one at dash.cloudflare.com → AI Gateway
 npx wrangler secret put CF_AI_GATEWAY_API_KEY      # your upstream provider's key
