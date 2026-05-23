@@ -461,7 +461,20 @@ app.get('/api/debug', async (c) => {
   });
 });
 
-// ── Admin API (protected — CF Access required) ────────────────────────────────
+// ── Admin API ─────────────────────────────────────────────────────────────────
+// All /api/admin/* and /_admin/* routes require the hermes_auth cookie.
+// The CF_ACCESS_* secrets are set for network-level protection, but the Worker
+// enforces cookie auth itself so there is no unauthenticated path to these routes.
+
+app.use('/api/admin/*', async (c, next) => {
+  if (!isAuthed(c.req.raw, c.env)) return c.json({ error: 'Unauthorized' }, 401);
+  await next();
+});
+
+app.use('/_admin/*', async (c, next) => {
+  if (!isAuthed(c.req.raw, c.env)) return c.redirect('/auth/login');
+  await next();
+});
 
 app.get('/api/admin/status', async (c) => {
   const sandbox = c.get('sandbox');
