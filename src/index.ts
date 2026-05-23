@@ -559,6 +559,21 @@ app.post('/api/admin/restart', async (c) => {
   }
 });
 
+// ── Admin SPA ─────────────────────────────────────────────────────────────────
+// Serve the built React admin UI from the ASSETS binding. The SPA is built
+// with base='/_admin/' so all asset references are /_admin/assets/…; we strip
+// that prefix before handing off to ASSETS so the lookup resolves correctly
+// against dist/client/ (e.g. /_admin/assets/x.js → /assets/x.js).
+// Placed before the cookie-auth middleware: CF Access is the protection layer
+// for /_admin, same as the /api/admin/* routes above.
+
+app.get('/_admin', (c) => c.redirect('/_admin/'));
+app.get('/_admin/*', async (c) => {
+  const url = new URL(c.req.url);
+  url.pathname = url.pathname.slice('/_admin'.length) || '/';
+  return c.env.ASSETS.fetch(new Request(url.toString(), c.req.raw));
+});
+
 // ── Protected catch-all: proxy to Hermes ──────────────────────────────────────
 
 // Validate env on all other routes
