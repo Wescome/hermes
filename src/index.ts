@@ -164,9 +164,8 @@ export async function restoreIfNeeded(sandbox: Sandbox, bucket: R2Bucket): Promi
 export async function createSnapshot(sandbox: Sandbox, bucket: R2Bucket): Promise<void> {
   const old = await getHandle(bucket);
   if (old) {
-    try {
-      await sandbox.deleteBackup(old);
-    } catch { /* already gone */ }
+    // deleteBackup does not exist in this SDK version — old backups expire via TTL.
+    // Just drop the R2 handle so we point at the new backup after creation.
     await bucket.delete(HANDLE_KEY);
   }
 
@@ -174,7 +173,7 @@ export async function createSnapshot(sandbox: Sandbox, bucket: R2Bucket): Promis
     await sandbox.exec(`chmod -R a+rX ${BACKUP_DIR}`);
   } catch { /* non-fatal */ }
 
-  const handle = await sandbox.createBackup(BACKUP_DIR);
+  const handle = await sandbox.createBackup({ dir: BACKUP_DIR });
   await bucket.put(HANDLE_KEY, JSON.stringify(handle));
   await bucket.delete(RESTORE_SIGNAL_KEY);
   _restored = true;
@@ -512,7 +511,7 @@ app.get('/api/admin/backup', async (c) => {
     () => null,
   );
   const meta = handle
-    ? await c.env.BACKUP_BUCKET.head(`backup-meta-${handle.id}`).catch(() => null)
+    ? await c.env.BACKUP_BUCKET.head(HANDLE_KEY).catch(() => null)
     : null;
   return c.json({
     backupId: handle?.id ?? null,
