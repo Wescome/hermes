@@ -12,7 +12,7 @@
 import { Hono } from 'hono';
 import { getSandbox, Sandbox, type SandboxOptions, type Process } from '@cloudflare/sandbox';
 import type { AppEnv, HermesEnv } from './types';
-import { GATEWAY_PORT, STARTUP_TIMEOUT_MS, BACKUP_DIR } from './config';
+import { GATEWAY_PORT, MESSAGING_GATEWAY_PORT, STARTUP_TIMEOUT_MS, BACKUP_DIR } from './config';
 
 // ── DO subclass: launches Hermes from the container lifecycle ─────────────────
 //
@@ -229,10 +229,10 @@ export async function findHermesProcess(sandbox: Sandbox): Promise<Process | nul
   return null;
 }
 
-async function isPortOpen(sandbox: Sandbox): Promise<boolean> {
+async function isPortOpen(sandbox: Sandbox, port = GATEWAY_PORT): Promise<boolean> {
   try {
     const r = await sandbox.exec(
-      `bash -c 'echo >/dev/tcp/localhost/${GATEWAY_PORT}' 2>/dev/null`,
+      `bash -c 'echo >/dev/tcp/localhost/${port}' 2>/dev/null`,
     );
     return r.exitCode === 0;
   } catch {
@@ -377,6 +377,11 @@ async function handleScheduled(env: HermesEnv): Promise<void> {
 
 const app = new Hono<AppEnv>();
 
+// Root is only an entry point for the Hermes UI. Keep this before any sandbox,
+// auth, asset, or proxy middleware so / can never fall through to Hermes's
+// default /sessions route or Cloudflare's SPA asset fallback.
+app.on(['GET', 'HEAD'], '/', (c) => c.redirect('/chat'));
+
 // Attach sandbox stub and execution context to every request
 app.use('*', async (c, next) => {
   const sandbox = getSandbox(c.env.Sandbox, 'hermes', buildSandboxOptions(c.env));
@@ -402,7 +407,7 @@ app.post('/auth/login', async (c) => {
   return new Response(null, {
     status: 302,
     headers: {
-      'Location': '/',
+      'Location': '/chat',
       'Set-Cookie': authCookieHeader(token),
     },
   });
@@ -415,6 +420,32 @@ app.get('/auth/logout', (c) => new Response(null, {
     'Set-Cookie': `${AUTH_COOKIE}=; Path=/; HttpOnly; Secure; Max-Age=0`,
   },
 }));
+
+// Messaging webhooks are called by external platforms, not by a browser with
+// hermes_auth. Proxy them to the Hermes gateway port instead of the dashboard.
+app.all('/webhook/*', async (c) => {
+  const sandbox = c.get('sandbox');
+
+  const missing = validateEnv(c.env);
+  if (missing.length > 0) {
+    return c.json({ error: 'Configuration error', missing }, 503);
+  }
+
+  const portOpen = await withTimeout(isPortOpen(sandbox, MESSAGING_GATEWAY_PORT).catch(() => false), 4_000, false);
+  if (!portOpen) {
+    c.executionCtx.waitUntil(
+      restoreIfNeeded(sandbox, c.env.BACKUP_BUCKET).catch(() => {}),
+    );
+    return c.json({ error: 'Hermes messaging gateway not ready' }, 503);
+  }
+
+  try {
+    const resp = await sandbox.containerFetch(c.req.raw, MESSAGING_GATEWAY_PORT);
+    return new Response(resp.body, { status: resp.status, headers: resp.headers });
+  } catch (err) {
+    return c.json({ error: 'Webhook proxy error', details: String(err) }, 502);
+  }
+});
 
 app.use('/api/*', async (c, next) => {
   if (!isAuthed(c.req.raw, c.env)) return c.json({ error: 'Unauthorized' }, 401);
@@ -602,13 +633,16 @@ app.use('*', async (c, next) => {
   await next();
 });
 
-// Cookie auth — redirect to login page if not authenticated
+// Cookie auth — redirect to login page if not authenticated; root → chat
 app.use('*', async (c, next) => {
   if (!isAuthed(c.req.raw, c.env)) {
     const acceptsHtml = c.req.header('Accept')?.includes('text/html');
     if (acceptsHtml) return c.redirect('/auth/login');
     return c.json({ error: 'Unauthorized' }, 401);
   }
+  const path = new URL(c.req.raw.url).pathname;
+  const isWS = c.req.raw.headers.get('Upgrade')?.toLowerCase() === 'websocket';
+  if (path === '/' && !isWS) return c.redirect('/chat');
   await next();
 });
 

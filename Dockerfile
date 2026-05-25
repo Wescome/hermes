@@ -46,6 +46,22 @@ RUN uv python install 3.13 && \
     uv pip install --python .venv/bin/python --no-cache \
       'hermes-agent[all,messaging]'
 
+# ── TUI build ─────────────────────────────────────────────────────────────────
+# hermes-agent pip wheel ships no prebuilt TUI bundle (_find_bundled_tui()=None).
+# Clone the matching tag, build dist/entry.js, and point HERMES_TUI_DIR at it
+# so the dashboard /chat PTY tab works in the container.
+RUN git clone --depth=1 --branch v2026.5.16 \
+      https://github.com/NousResearch/hermes-agent.git /tmp/hermes-src && \
+    cd /tmp/hermes-src/ui-tui && \
+    npm install --silent --no-fund --no-audit && \
+    npm run build && \
+    mkdir -p /opt/hermes-tui && \
+    cp -r dist /opt/hermes-tui/ && \
+    cp package.json /opt/hermes-tui/ && \
+    rm -rf /tmp/hermes-src
+
+ENV HERMES_TUI_DIR=/opt/hermes-tui
+
 # ── Startup script ────────────────────────────────────────────────────────────
 # The Worker starts this via sandbox.startProcess() — NOT the container ENTRYPOINT.
 COPY start-hermes.sh /usr/local/bin/start-hermes.sh
@@ -54,7 +70,7 @@ RUN chmod +x /usr/local/bin/start-hermes.sh
 # ── Permissions ───────────────────────────────────────────────────────────────
 # Make /opt/python and /opt/hermes world-readable+traversable so the unprivileged
 # hermes user can resolve symlinks into the managed Python install.
-RUN chmod -R a+rX /opt/python /opt/hermes && \
+RUN chmod -R a+rX /opt/python /opt/hermes /opt/hermes-tui && \
     chown -R hermes:hermes /opt/hermes/.venv
 
 # ── Runtime environment ───────────────────────────────────────────────────────

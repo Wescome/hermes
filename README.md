@@ -192,6 +192,21 @@ For Telegram webhooks to reach the container, set your bot's webhook URL to your
 curl "https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://hermes-sandbox.<subdomain>.workers.dev/webhook/telegram"
 ```
 
+For this deployment, the webhook URL is:
+
+```bash
+https://hermes-sandbox.koales.workers.dev/webhook/telegram
+```
+
+If you want to restrict access to your own Telegram user or group, message the
+bot once before setting the webhook, then run:
+
+```bash
+curl "https://api.telegram.org/bot<TOKEN>/getUpdates"
+```
+
+Copy the `message.chat.id` value into `TELEGRAM_ALLOWED_CHATS`.
+
 ---
 
 ## Persistence
