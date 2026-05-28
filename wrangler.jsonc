@@ -57,10 +57,7 @@
   "browser": {
     "binding": "BROWSER",
   },
-  // Wake container 1 min before each hour so Hermes cron jobs don't cold-start
-  "triggers": {
-    "crons": ["59 * * * *"],
-  },
+  // No scheduled cron — container wakes on demand only
   // ── Required secrets (set via `wrangler secret put`) ─────────────────────────
   //
   // AI provider — choose ONE:
