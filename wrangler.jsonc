@@ -59,7 +59,7 @@
   },
   // Wake container 1 min before each hour so Hermes cron jobs don't cold-start
   "triggers": {
-    "crons": ["* * * * *"],
+    "crons": ["59 * * * *"],
   },
   // ── Required secrets (set via `wrangler secret put`) ─────────────────────────
   //
